@@ -4,14 +4,177 @@ use std::fs;
 use std::io::{self, Write};
 
 const MAX_CHUNK_CHARS: usize = 12_000;
+const DEFAULT_MODEL: &str = "haiku";
+const API_BASE: &str = "https://api.anthropic.com/v1";
+const FAMILIES: [&str; 4] = ["haiku", "sonnet", "opus", "fable"];
 
-async fn call_claude(system: &str, user_message: &str, max_tokens: u32, api_key: &str) -> String {
-    let body = serde_json::json!({
-        "model": "claude-haiku-4-5-20251001",
+struct Ctx {
+    api_key: String,
+    model: String,
+    supports_effort: bool,
+}
+
+struct ModelInfo {
+    id: String,
+    created_at: String,
+    supports_low_effort: bool,
+}
+
+impl ModelInfo {
+    fn from_json(m: &serde_json::Value) -> Option<Self> {
+        Some(ModelInfo {
+            id: m["id"].as_str()?.to_string(),
+            created_at: m["created_at"].as_str().unwrap_or("").to_string(),
+            supports_low_effort: m["capabilities"]["effort"]["low"]["supported"]
+                .as_bool()
+                .unwrap_or(false),
+        })
+    }
+}
+
+fn config_path() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    std::path::PathBuf::from(home).join(".config/auto_push/config")
+}
+
+fn load_saved_model() -> Option<String> {
+    let content = fs::read_to_string(config_path()).ok()?;
+    content.lines().find_map(|line| {
+        let value = line.trim().strip_prefix("model=")?.trim();
+        (!value.is_empty()).then(|| value.to_string())
+    })
+}
+
+fn save_model(model: &str) {
+    let path = config_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("Failed to create config directory");
+    }
+    fs::write(&path, format!("model={model}\n")).expect("Failed to write config file");
+    println!("✓ Default model set to `{model}` (saved in {})", path.display());
+}
+
+async fn list_models(api_key: &str) -> Result<Vec<ModelInfo>, String> {
+    let resp = reqwest::Client::new()
+        .get(format!("{API_BASE}/models?limit=1000"))
+        .header("x-api-key", api_key)
+        .header("anthropic-version", "2023-06-01")
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let res: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    let data = res["data"]
+        .as_array()
+        .ok_or_else(|| format!("unexpected response: {res}"))?;
+    Ok(data.iter().filter_map(ModelInfo::from_json).collect())
+}
+
+/// Newest model whose id starts with `claude-<family>` (e.g. "haiku" -> claude-haiku-5-5).
+fn newest_in_family<'a>(models: &'a [ModelInfo], family: &str) -> Option<&'a ModelInfo> {
+    let prefix = format!("claude-{family}-");
+    models
+        .iter()
+        .filter(|m| m.id.starts_with(&prefix))
+        .max_by(|a, b| a.created_at.cmp(&b.created_at))
+}
+
+/// Accepts an alias ("haiku", "sonnet", "opus", "fable") or a full model id.
+/// Aliases always resolve to the newest model of that family, so new releases are picked up automatically.
+async fn resolve_model(wanted: &str, api_key: &str) -> (String, bool) {
+    let wanted = wanted.trim().to_lowercase();
+    let models = match list_models(api_key).await {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("Warning: could not list models ({e}), using `{wanted}` as-is.");
+            let fallback = match wanted.as_str() {
+                "haiku" => "claude-haiku-5-5",
+                "sonnet" => "claude-sonnet-5-5",
+                "opus" => "claude-opus-5-5",
+                "fable" => "claude-fable-5-2",
+                other => other,
+            };
+            return (fallback.to_string(), false);
+        }
+    };
+
+    if let Some(m) = models.iter().find(|m| m.id == wanted) {
+        return (m.id.clone(), m.supports_low_effort);
+    }
+    let family = wanted.strip_prefix("claude-").unwrap_or(&wanted);
+    if let Some(m) = newest_in_family(&models, family) {
+        return (m.id.clone(), m.supports_low_effort);
+    }
+
+    eprintln!("Unknown model `{wanted}`. Available models:");
+    for m in &models {
+        eprintln!("  {}", m.id);
+    }
+    std::process::exit(1);
+}
+
+async fn pick_model_interactively(api_key: &str) {
+    let models = list_models(api_key).await.unwrap_or_else(|e| {
+        eprintln!("Could not list models: {e}");
+        std::process::exit(1);
+    });
+
+    let mut choices: Vec<(String, String)> = Vec::new();
+    for family in FAMILIES {
+        if let Some(m) = newest_in_family(&models, family) {
+            choices.push((family.to_string(), format!("{family:<8} → always the newest {family} (today: {})", m.id)));
+        }
+    }
+    for m in &models {
+        choices.push((m.id.clone(), m.id.clone()));
+    }
+
+    let current = load_saved_model().unwrap_or_else(|| DEFAULT_MODEL.to_string());
+    println!("Current default: {current}\n");
+    for (i, (_, label)) in choices.iter().enumerate() {
+        println!("  {:>2}) {label}", i + 1);
+    }
+    print!("\nChoose a default model [1-{}]: ", choices.len());
+    io::stdout().flush().unwrap();
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input).unwrap();
+    match input.trim().parse::<usize>() {
+        Ok(n) if (1..=choices.len()).contains(&n) => save_model(&choices[n - 1].0),
+        _ => {
+            eprintln!("Invalid choice, nothing changed.");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn print_help() {
+    println!(
+        "auto_push — stage, generate a commit message with Claude, commit and push.
+
+Usage:
+  auto_push                        Use the default model (currently: {})
+  auto_push -model <model>         Use <model> for this run only
+  auto_push -model <model> --save  Make <model> the default (no commit)
+  auto_push -model                 Pick the default model from a menu (no commit)
+
+<model> is an alias (haiku, sonnet, opus, fable) that always points to the
+newest model of that family, or an exact id like claude-sonnet-5-5.",
+        load_saved_model().unwrap_or_else(|| DEFAULT_MODEL.to_string())
+    );
+}
+
+async fn call_claude(system: &str, user_message: &str, max_tokens: u32, ctx: &Ctx) -> String {
+    let mut body = serde_json::json!({
+        "model": ctx.model,
         "max_tokens": max_tokens,
         "system": system,
         "messages": [{ "role": "user", "content": user_message }]
     });
+    // Commit messages are simple: keep thinking short on models that support effort.
+    if ctx.supports_effort {
+        body["output_config"] = serde_json::json!({ "effort": "low" });
+    }
+    let api_key = ctx.api_key.as_str();
 
     let client = reqwest::Client::new();
     let max_retries = 3;
@@ -30,8 +193,18 @@ async fn call_claude(system: &str, user_message: &str, max_tokens: u32, api_key:
         let status = resp.status();
         let res: serde_json::Value = resp.json().await.unwrap();
 
-        if let Some(text) = res["content"][0]["text"].as_str() {
-            return text.to_string();
+        if res["stop_reason"].as_str() == Some("refusal") {
+            eprintln!("The model declined this request: {}", res["stop_details"]);
+            std::process::exit(1);
+        }
+
+        // Newer models may return thinking blocks before the text block.
+        let text = res["content"]
+            .as_array()
+            .and_then(|blocks| blocks.iter().find(|b| b["type"] == "text"))
+            .and_then(|b| b["text"].as_str());
+        if let Some(text) = text {
+            return text.trim().to_string();
         }
 
         let is_rate_limit = status == 429
@@ -79,7 +252,7 @@ fn split_diff_into_chunks(diff: &str) -> Vec<String> {
     chunks
 }
 
-async fn summarize_chunk(chunk: &str, chunk_index: usize, total_chunks: usize, api_key: &str) -> String {
+async fn summarize_chunk(chunk: &str, chunk_index: usize, total_chunks: usize, ctx: &Ctx) -> String {
     let system = "You summarize git diffs. Be concise but preserve all important details: files changed, what was added/removed/modified, and why.";
     let prompt = format!(
         "Summarize this git diff (part {}/{}):\n\n{}",
@@ -88,10 +261,10 @@ async fn summarize_chunk(chunk: &str, chunk_index: usize, total_chunks: usize, a
         chunk
     );
     println!("  Summarizing chunk {}/{}...", chunk_index + 1, total_chunks);
-    call_claude(system, &prompt, 512, api_key).await
+    call_claude(system, &prompt, 4096, ctx).await
 }
 
-async fn generate_commit_message(context: &str, api_key: &str) -> String {
+async fn generate_commit_message(context: &str, ctx: &Ctx) -> String {
     let system = "You generate git commit messages. Output ONLY the commit message. No markdown, no backticks.";
     let prompt = format!(
 r#"You are a Git commit message generator.
@@ -121,7 +294,7 @@ Store refresh tokens in encrypted cookie.
 --- CHANGES ---
 {context}"#
     );
-    call_claude(system, &prompt, 512, api_key).await
+    call_claude(system, &prompt, 4096, ctx).await
 }
 
 fn get_api_key() -> String {
@@ -223,6 +396,27 @@ fn cut_the_prompt(prompt: &str) -> (String, String) {
 
 #[tokio::main]
 async fn main() {
+	let args: Vec<String> = std::env::args().skip(1).collect();
+	if args.iter().any(|a| a == "-h" || a == "--help") {
+		print_help();
+		return;
+	}
+	let save = args.iter().any(|a| a == "--save");
+	let model_flag = args.iter().position(|a| a == "-model" || a == "--model" || a == "-m");
+	let model_arg = model_flag.map(|i| args.get(i + 1).filter(|v| !v.starts_with('-')).cloned());
+
+	if let Some(None) = model_arg {
+		let api_key = get_api_key();
+		pick_model_interactively(&api_key).await;
+		return;
+	}
+	if let Some(Some(model)) = &model_arg
+		&& save
+	{
+		save_model(model);
+		return;
+	}
+
 	Command::new("git")
 		.args(&["add", "."])
 		.output()
@@ -239,6 +433,13 @@ async fn main() {
 	let readmes = get_all_the_readmes().unwrap_or_default();
 
 	let api_key = get_api_key();
+	let wanted = model_arg
+		.flatten()
+		.or_else(load_saved_model)
+		.unwrap_or_else(|| DEFAULT_MODEL.to_string());
+	let (model, supports_effort) = resolve_model(&wanted, &api_key).await;
+	println!("Using model: {model}");
+	let ctx = Ctx { api_key, model, supports_effort };
 
 	let chunks = split_diff_into_chunks(&diff);
 	let context = if chunks.len() == 1 {
@@ -254,7 +455,7 @@ async fn main() {
 		println!("Diff is large ({} chars), splitting into {} chunks...", diff.len(), chunks.len());
 		let mut summaries = Vec::new();
 		for (i, chunk) in chunks.iter().enumerate() {
-			let summary = summarize_chunk(chunk, i, chunks.len(), &api_key).await;
+			let summary = summarize_chunk(chunk, i, chunks.len(), &ctx).await;
 			summaries.push(summary);
 		}
 		let mut ctx = String::from("Summaries of all changes:\n\n");
@@ -268,7 +469,7 @@ async fn main() {
 		ctx
 	};
 
-	let prompt_result = generate_commit_message(&context, &api_key).await;
+	let prompt_result = generate_commit_message(&context, &ctx).await;
 
 	let (title, body) = cut_the_prompt(&prompt_result);
 	println!("Generated commit message:\n{}\n{}", title, body);

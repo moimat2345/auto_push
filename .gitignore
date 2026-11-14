@@ -25,3 +25,11 @@ target
 
 /target
 .gitignore
+
+# Build folders, including iCloud copies like "target 2"
+target*/
+
+# macOS / iCloud sync artifacts
+.DS_Store
+* 2
+* 2.*

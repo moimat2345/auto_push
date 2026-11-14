@@ -36,7 +36,8 @@ Changes pushed successfully.
 
 ### Key features
 
-- **AI-generated commit messages** using Claude (Haiku) via the Anthropic API
+- **AI-generated commit messages** using Claude via the Anthropic API (newest Haiku by default)
+- **Switchable model** — `auto_push -model sonnet` for an important commit, aliases always track the newest release
 - **Conventional Commits format** — `feat:`, `fix:`, `refactor:`, `docs:`, etc.
 - **Context-aware** — includes README files content for better commit messages
 - **Full pipeline** — stages, commits, and pushes in a single command
@@ -80,6 +81,18 @@ Just run it from any git repository with staged or unstaged changes. The tool ha
 git add .  →  git diff --staged  →  Claude API  →  git commit  →  git push
 ```
 
+### Choosing the model
+
+```sh
+auto_push -model sonnet           # use Sonnet for this run only
+auto_push -model opus --save      # make Opus the default (no commit)
+auto_push -model                  # pick the default from a menu (no commit)
+auto_push -model claude-haiku-5-5 # pin an exact model id
+auto_push --help
+```
+
+`haiku`, `sonnet`, `opus` and `fable` are aliases resolved through the Anthropic Models API to the **newest model of that family** on every run — when a new Haiku ships, `haiku` uses it automatically, no update needed. The default is `haiku`; the saved choice lives in `~/.config/auto_push/config`.
+
 ---
 
 ## How It Works
@@ -87,7 +100,7 @@ git add .  →  git diff --staged  →  Claude API  →  git commit  →  git pu
 ```
 ┌──────────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
 │   Stage      │────▶│  Diff        │────▶│  Context     │────▶│  Claude API  │────▶│  Commit      │
-│  git add .   │     │  --staged    │     │  + READMEs   │     │  (Haiku)     │     │  + Push      │
+│  git add .   │     │  --staged    │     │  + READMEs   │     │  (model)     │     │  + Push      │
 └──────────────┘     └──────────────┘     └──────────────┘     └──────────────┘     └──────────────┘
 ```
 

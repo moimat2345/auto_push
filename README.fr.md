@@ -36,7 +36,8 @@ Changes pushed successfully.
 
 ### Fonctionnalites cles
 
-- **Messages de commit generes par IA** via Claude (Haiku) et l'API Anthropic
+- **Messages de commit generes par IA** via Claude et l'API Anthropic (dernier Haiku par defaut)
+- **Modele au choix** — `auto_push -model sonnet` pour un gros commit, les alias suivent toujours la derniere version
 - **Format Conventional Commits** — `feat:`, `fix:`, `refactor:`, `docs:`, etc.
 - **Contextuel** — inclut le contenu des fichiers README pour des messages plus pertinents
 - **Pipeline complet** — stage, commit et push en une seule commande
@@ -80,6 +81,18 @@ Lancez-le depuis n'importe quel depot git avec des changements. L'outil gere tou
 git add .  →  git diff --staged  →  API Claude  →  git commit  →  git push
 ```
 
+### Choisir le modele
+
+```sh
+auto_push -model sonnet           # Sonnet juste pour ce lancement
+auto_push -model opus --save      # Opus devient le modele par defaut (pas de commit)
+auto_push -model                  # choisir le defaut dans un menu (pas de commit)
+auto_push -model claude-haiku-5-5 # fixer un id de modele exact
+auto_push --help
+```
+
+`haiku`, `sonnet`, `opus` et `fable` sont des alias resolus via l'API Models d'Anthropic vers le **modele le plus recent de la famille** a chaque lancement — quand un nouveau Haiku sort, `haiku` l'utilise automatiquement, sans mise a jour. Le defaut est `haiku` ; le choix sauvegarde est dans `~/.config/auto_push/config`.
+
 ---
 
 ## Comment ca marche
@@ -87,7 +100,7 @@ git add .  →  git diff --staged  →  API Claude  →  git commit  →  git pu
 ```
 ┌──────────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
 │   Stage      │────▶│  Diff        │────▶│  Contexte    │────▶│  API Claude  │────▶│  Commit      │
-│  git add .   │     │  --staged    │     │  + READMEs   │     │  (Haiku)     │     │  + Push      │
+│  git add .   │     │  --staged    │     │  + READMEs   │     │  (modele)    │     │  + Push      │
 └──────────────┘     └──────────────┘     └──────────────┘     └──────────────┘     └──────────────┘
 ```
 
